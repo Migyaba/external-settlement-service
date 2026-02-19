@@ -13,7 +13,8 @@ from models import Base, ExternalSettlementNotification
 
 # Configuration
 load_dotenv()
-HUB_BASE_URL = os.getenv("HUB_BASE_URL", "http://localhost:3000/v2")
+HUB_BASE_URL = os.getenv("HUB_BASE_URL")
+LEDGER_URL = os.getenv("LEDGER_URL")
 API_KEY = os.getenv("API_KEY", "dev-secret-key")
 # Désactiver les avertissements SSL pour les environnements de test/cluster
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -41,6 +42,73 @@ def verify_api_key(x_api_key: str = Header(None)):
         raise HTTPException(status_code=403, detail="Clé API invalide")
     return x_api_key
 
+def build_account_to_participant_map():
+    """Construit un mapping account_id -> participant_name via le Central Ledger"""
+    try:
+        resp = requests.get(f"{LEDGER_URL}/participants", verify=False, timeout=5)
+        if resp.status_code != 200:
+            return {}
+        
+        participants = resp.json()
+        mapping = {}
+        for p in participants:
+            for account in p.get("accounts", []):
+                mapping[account["id"]] = {
+                    "name": p["name"],
+                    "currency": account["currency"],
+                    "ledgerAccountType": account["ledgerAccountType"]
+                }
+        return mapping
+    except Exception:
+        return {}
+
+def get_participant_endpoint_email(participant_name: str) -> Optional[str]:
+    """Récupère l'email de notification spécifique pour un participant"""
+    try:
+        resp = requests.get(f"{LEDGER_URL}/participants/{participant_name}/endpoints", verify=False, timeout=5)
+        if resp.status_code != 200:
+            return None
+        
+        endpoints = resp.json()
+        for ep in endpoints:
+            if ep.get("type") == "SETTLEMENT_TRANSFER_POSITION_CHANGE_EMAIL":
+                return ep.get("value")
+        return None
+    except Exception:
+        return None
+
+def send_stakeholder_notifications(settlement_id: str, participants: list):
+    """
+    Simule l'envoi de notifications aux parties prenantes (participants et opérateurs).
+    Dans un environnement de production, cela pourrait appeler un service Email/SMS ou un Webhook.
+    """
+    print(f"\n [NOTIFICATION ENGINE] Début des alertes pour le Settlement {settlement_id}")
+    
+    # On récupère le mapping réel (AccountID -> Nom)
+    account_map = build_account_to_participant_map()
+    
+    for p in participants:
+        # Dans le settlement, on a souvent des comptes. On cherche le nom réel via l'ID de compte.
+        accounts = p.get("accounts", [])
+        p_id = p.get("id") or p.get("participantId")
+        
+        # On essaie de trouver un nom lisible
+        if accounts:
+            acc_id = accounts[0].get("id")
+            if acc_id in account_map:
+                participant_name = account_map[acc_id]['name']
+                email = get_participant_endpoint_email(participant_name)
+                email_str = f" to {email}" if email else ""
+                print(f"Alerte envoyée au {participant_name}({p_id}) sur le {email} : Settlement {settlement_id} CONFIRMÉ.")
+            else:
+                print(f"Alerte envoyée au Participant({p_id}) : Settlement {settlement_id} CONFIRMÉ.")
+        else:
+            print(f"Alerte envoyée au Participant({p_id}) : Settlement {settlement_id} CONFIRMÉ.")
+    
+    # Alerte pour l'Opérateur du Hub
+    print(f"Alerte envoyée à l'OPÉRATEUR HUB : Cycle de règlement {settlement_id} CLÔTURÉ.")
+    print("-------------------------------------------------------------------\n")
+
 @app.get("/health")
 def health_check():
     """Vérification de l'état de santé du service."""
@@ -52,7 +120,7 @@ def notify_external_settlement(
     payload: dict,
     db: Session = Depends(get_db),
     # auth: str = Depends(verify_api_key) # Décommentez pour activer la sécurité
-):
+    ):
     """
     Reçoit une notification de règlement d'un participant et met à jour le Hub Mojaloop.
     """
@@ -132,7 +200,10 @@ def notify_external_settlement(
             except Exception:
                 pass # Échec non bloquant si déjà traité par un autre thread
         
-        return {"message": "Règlement finalisé. Tous les participants ont notifié.", "status": "FINALIZED"}
+        # Envoi des notifications aux parties prenantes (Nouvelle Tâche)
+        send_stakeholder_notifications(settlement_id, participants_list)
+        
+        return {"message": "Règlement finalisé. Tous les participants et opérateurs ont été notifiés.", "status": "FINALIZED"}
 
     return {"message": "Notification enregistrée avec succès", "status": "PENDING_QUORUM"}
 

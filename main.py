@@ -150,7 +150,7 @@ def notify_external_settlement(
 
     # 2. Validation du statut
     state = settlement_data.get("state")
-    allowed_states = ["PS_TRANSFERS_RECORDED", "PS_TRANSFERS_COMMITTED", "SETTLED"]
+    allowed_states = ["PS_TRANSFERS_RECORDED","PS_TRANSFERS_RESERVED","PS_TRANSFERS_COMMITTED","SETTLED"]
     if state not in allowed_states:
         raise HTTPException(status_code=400, detail=f"Statut settlement invalide pour notification: {state}")
 

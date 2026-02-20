@@ -70,13 +70,16 @@ Table `notifications` :
 
 Le flux se décompose ensuite en 7 étapes critiques de traitement et de sécurité :
 
-#### 1. Récupération et préparation des données
+#### 1. Récupération et préparation des données (Validation Pydantic)
 ```python
-participant_id = payload.get("participantId")
-# ... extraction des autres champs (amount, currency, etc.)
+class SettlementNotificationRequest(BaseModel):
+    participantId: str
+    amount: float = Field(..., gt=0)
+    currency: str = Field(..., min_length=3, max_length=3)
+    # ...
 ```
-- **Ce que ça fait** : Le service fouille dans le JSON envoyé par le participant pour extraire les informations essentielles.
-- **Pourquoi c'est important** : Si le `participantId` est absent, on arrête tout de suite avec une erreur 400, car on ne peut pas traiter une notification sans savoir qui l'envoie.
+- **Ce que ça fait** : Le service utilise **Pydantic** pour valider automatiquement la complétude et le type des données envoyées par le participant.
+- **Pourquoi c'est important** : Cela garantit que le `participantId` est présent, que le `amount` est un nombre positif et que la `currency` respecte le format ISO. Si ces conditions ne sont pas remplies, l'API rejette la requête avec une erreur **422 Unprocessable Entity**.
 
 #### 2. Double vérification avec le Hub (Le "Check" de sécurité)
 ```python
@@ -93,12 +96,15 @@ allowed_states = ["PS_TRANSFERS_RECORDED","PS_TRANSFERS_RESERVED","PS_TRANSFERS_
 - **Ce que ça fait** : On vérifie que le règlement est dans un état où il est "prêt" à recevoir de l'argent (par exemple RECORDED ou COMMITTED).
 - **Pourquoi c'est important** : On ne veut pas accepter de notification si le règlement est déjà annulé (ABORTED).
 
-#### 4. Vérification d'appartenance
+#### 4. Vérification d'appartenance et Conformité Métier
 ```python
-participant_exists = any(str(p.get("id") or p.get("participantId")) == str(participant_id) for p in participants_list)
+# Validation du montant et de la devise
+net_amount_obj = participant_accounts[0].get("netSettlementAmount", {})
+if abs(float(amount) - abs(float(hub_amount))) > 0.01:
+    raise HTTPException(...)
 ```
-- **Ce que ça fait** : Le code parcourt la liste des participants officiels renvoyée par le Hub pour voir si celui qui envoie la notification est bien censé payer quelque chose dans ce règlement précis.
-- **Pourquoi c'est important** : **Sécurité**. Un participant ne doit pas pouvoir notifier le règlement d'un autre.
+- **Ce que ça fait** : Le code compare le montant et la devise notifiés avec les données réelles du Hub pour ce participant spécifique. Il utilise la valeur absolue (`abs()`) pour gérer les montants négatifs (débiteurs) du Hub.
+- **Pourquoi c'est important** : **Intégrité financière**. On rejette la notification si le participant déclare avoir payé 1000 alors que le Hub attend 1200. Cela garantit que le virement bancaire correspond exactement à l'obligation calculée.
 
 #### 5. Gestion de l'idempotence (Anti-doublon)
 ```python
@@ -155,8 +161,14 @@ sequenceDiagram
 
 ### 4.1 Notre Service (Inbound)
 - **POST `/external-settlement/{settlement_id}`**
-  - **Body** : `{"participantId": "ID", "amount": 0, "currency": "XXX", "reference": "REF"}`
-  - **Succès (200)** : Retourne un message de confirmation et l'état de finalisation.
+  - **Body détaillé** : 
+    - `participantId` (string, requis) : ID du FSP.
+    - `amount` (float, requis, > 0) : Montant du virement réel.
+    - `currency` (string, requis, ISO 3 lettres) : Devise du virement.
+    - `reference` (string, requis) : Preuve de paiement.
+  - **Succès (200)** : Retourne l'état du quorum.
+  - **Erreur (422)** : Données mal formées ou incomplètes (Validation Pydantic).
+  - **Erreur (400)** : Incohérence de montant ou de devise avec le Hub.
 
 ### 4.2 Central Settlement Hub (Outbound)
 - **GET `/v2/settlements/{id}`** : Récupère la liste des participants et leurs comptes présents dans le règlement.

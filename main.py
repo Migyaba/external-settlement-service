@@ -7,6 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 from database import SessionLocal, engine
 from models import Base, ExternalSettlementNotification
@@ -35,6 +36,14 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# Schéma de validation pour les notifications 
+class SettlementNotificationRequest(BaseModel):
+    participantId: str
+    amount: float = Field(..., gt=0, description="Le montant doit être supérieur à zéro")
+    currency: str = Field(..., min_length=3, max_length=3, description="Code devise ISO (3 lettres)")
+    reference: str = Field(..., min_length=1, description="La référence du virement est obligatoire")
+    settledAt: Optional[str] = None
 
 # Sécurité simple via API Key (Optionnel)
 def verify_api_key(x_api_key: str = Header(None)):
@@ -115,23 +124,20 @@ def health_check():
     return {"status": "OK", "timestamp": datetime.utcnow()}
 
 @app.post("/external-settlement/{settlement_id}")
-def notify_external_settlement(
+async def notify_external_settlement(
     settlement_id: str,
-    payload: dict,
+    payload: SettlementNotificationRequest,
     db: Session = Depends(get_db),
     # auth: str = Depends(verify_api_key) # Décommentez pour activer la sécurité
     ):
     """
     Reçoit une notification de règlement d'un participant et met à jour le Hub Mojaloop.
     """
-    participant_id = payload.get("participantId")
-    amount = payload.get("amount")
-    currency = payload.get("currency")
-    reference = payload.get("reference")
-    settled_at_str = payload.get("settledAt")
-
-    if not participant_id:
-        raise HTTPException(status_code=400, detail="participantId est requis")
+    participant_id = payload.participantId
+    amount = payload.amount
+    currency = payload.currency
+    reference = payload.reference
+    settled_at_str = payload.settledAt
 
     # 1. Vérification du Settlement dans le Hub
     try:
@@ -154,12 +160,41 @@ def notify_external_settlement(
     if state not in allowed_states:
         raise HTTPException(status_code=400, detail=f"Statut settlement invalide pour notification: {state}")
 
-    # 3. Vérification du participant
+    # 3. Vérification du participant et conformité métier
     participants_list = settlement_data.get("participants") or settlement_data.get("participantSettlements") or []
-    participant_exists = any(str(p.get("id") or p.get("participantId")) == str(participant_id) for p in participants_list)
-
-    if not participant_exists:
+    
+    # Recherche du participant spécifique dans les données du Hub
+    target_participant = next((p for p in participants_list if str(p.get("id") or p.get("participantId")) == str(participant_id)), None)
+    
+    if not target_participant:
         raise HTTPException(status_code=403, detail=f"Le participant {participant_id} n'appartient pas à ce règlement")
+
+    # VALIDATION MÉTIER : Comparaison du montant et de la devise
+    participant_accounts = target_participant.get("accounts", [])
+    if not participant_accounts:
+        raise HTTPException(status_code=400, detail="Données de compte manquantes pour ce participant dans le Hub")
+
+    # Extraction depuis netSettlementAmount (qui est un objet dans le Hub)
+    net_amount_obj = participant_accounts[0].get("netSettlementAmount", {})
+    hub_amount = net_amount_obj.get("amount")
+    hub_currency = net_amount_obj.get("currency")
+
+    if hub_amount is None:
+        raise HTTPException(status_code=400, detail="Impossible de vérifier le montant attendu auprès du Hub")
+
+    # On utilise abs() car le Hub affiche des montants négatifs pour les payeurs
+    # et les participants notifient généralement le montant absolu transféré.
+    if abs(float(amount) - abs(float(hub_amount))) > 0.01:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Incohérence métier : Montant notifié ({amount}) != Montant Hub ({abs(float(hub_amount))})"
+        )
+    
+    if currency != hub_currency:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Incohérence métier : Devise notifiée ({currency}) != Devise Hub ({hub_currency})"
+        )
 
     # 4. Gestion de l'idempotence et vérification du quorum
     existing = db.query(ExternalSettlementNotification).filter(

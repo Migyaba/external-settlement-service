@@ -1,7 +1,7 @@
 import os
 import requests
 import urllib3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Header
@@ -11,12 +11,23 @@ from pydantic import BaseModel, Field
 
 from database import SessionLocal, engine
 from models import Base, ExternalSettlementNotification
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
 
 # Configuration
 load_dotenv()
+OPERATOR_EMAIL = os.getenv("OPERATOR_EMAIL")
 HUB_BASE_URL = os.getenv("HUB_BASE_URL")
 LEDGER_URL = os.getenv("LEDGER_URL")
 API_KEY = os.getenv("API_KEY", "dev-secret-key")
+
+# Configuration SMTP Gmail
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 # Désactiver les avertissements SSL pour les environnements de test/cluster
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -86,37 +97,138 @@ def get_participant_endpoint_email(participant_name: str) -> Optional[str]:
     except Exception:
         return None
 
+
+def _send_email_smtp(to_email: str, subject: str, html_content: str):
+    """Effectue l'envoi réel via le serveur SMTP Gmail."""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        print("[ERREUR] SMTP_USERNAME ou SMTP_PASSWORD non configuré dans .env")
+        return False
+
+    msg = MIMEMultipart()
+    msg['From'] = f"Mojaloop Hub Service <{SMTP_USERNAME}>"
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html_content, 'html'))
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()  # Sécurisation de la connexion
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"[SMTP ERROR] Impossible d'envoyer à {to_email} : {e}")
+        return False
+
 def send_stakeholder_notifications(settlement_id: str, participants: list):
     """
-    Simule l'envoi de notifications aux parties prenantes (participants et opérateurs).
-    Dans un environnement de production, cela pourrait appeler un service Email/SMS ou un Webhook.
+    Envoie des notifications réelles par email via SMTP Gmail.
     """
-    print(f"\n [NOTIFICATION ENGINE] Début des alertes pour le Settlement {settlement_id}")
-    
-    # On récupère le mapping réel (AccountID -> Nom)
+    print(f"\n[NOTIFICATION ENGINE] Début des alertes SMTP pour le Settlement {settlement_id}")
+
     account_map = build_account_to_participant_map()
-    
+    errors = []
+
     for p in participants:
-        # Dans le settlement, on a souvent des comptes. On cherche le nom réel via l'ID de compte.
         accounts = p.get("accounts", [])
         p_id = p.get("id") or p.get("participantId")
-        
-        # On essaie de trouver un nom lisible
+
         if accounts:
             acc_id = accounts[0].get("id")
             if acc_id in account_map:
                 participant_name = account_map[acc_id]['name']
                 email = get_participant_endpoint_email(participant_name)
-                email_str = f" to {email}" if email else ""
-                print(f"Alerte envoyée au {participant_name}({p_id}) sur le {email} : Settlement {settlement_id} CONFIRMÉ.")
+
+                if email:
+                    success = _send_email_smtp(
+                        to_email=email,
+                        subject=f"[MOJALOOP] Settlement {settlement_id} — CONFIRMÉ",
+                        html_content=_build_participant_email(participant_name, settlement_id, p_id)
+                    )
+                    if success:
+                        print(f"[OK] Email SMTP envoye a {participant_name}({p_id}) → {email}")
+                    else:
+                        errors.append({"participant": participant_name, "error": "Erreur SMTP"})
+                else:
+                    print(f"[WARN] Pas d'email configure pour {participant_name} — ignoree")
             else:
-                print(f"Alerte envoyée au Participant({p_id}) : Settlement {settlement_id} CONFIRMÉ.")
+                print(f"[WARN] Compte {acc_id} introuvable dans le mapping")
         else:
-            print(f"Alerte envoyée au Participant({p_id}) : Settlement {settlement_id} CONFIRMÉ.")
-    
-    # Alerte pour l'Opérateur du Hub
-    print(f"Alerte envoyée à l'OPÉRATEUR HUB : Cycle de règlement {settlement_id} CLÔTURÉ.")
+            print(f"[WARN] Aucun compte trouve pour Participant({p_id})")
+
+    # Notification Opérateur
+    if OPERATOR_EMAIL:
+        success_op = _send_email_smtp(
+            to_email=OPERATOR_EMAIL,
+            subject=f"[MOJALOOP] Cycle de règlement {settlement_id} — CLÔTURÉ",
+            html_content=_build_operator_email(settlement_id, participants, errors)
+        )
+        if success_op:
+            print(f"[OK] Email SMTP envoye a l'OPERATEUR HUB → {OPERATOR_EMAIL}")
+        else:
+            print("[ERREUR] Echec notification operateur par SMTP")
+
     print("-------------------------------------------------------------------\n")
+
+
+def _build_participant_email(name: str, settlement_id: str, p_id) -> str:
+    return f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto;">
+        <h2 style="color: #1F4E79;">Confirmation de Règlement</h2>
+        <p>Bonjour <strong>{name}</strong>,</p>
+        <p>Le cycle de règlement <strong>{settlement_id}</strong> a été <strong style="color: green;">CONFIRMÉ</strong>.</p>
+        <table style="border-collapse: collapse; width: 100%;">
+            <tr style="background: #D6E4F0;">
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Settlement ID</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{settlement_id}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Participant ID</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{p_id}</td>
+            </tr>
+            <tr style="background: #D6E4F0;">
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Date</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</td>
+            </tr>
+        </table>
+        <p style="color: #595959; font-size: 12px; margin-top: 20px;">
+            Ce message est généré automatiquement par le Hub Mojaloop — BFT Projet.
+        </p>
+    </div>
+    """
+
+
+def _build_operator_email(settlement_id: str, participants: list, errors: list) -> str:
+    error_section = ""
+    if errors:
+        error_section = f"""
+        <h3 style="color: #B71C1C;">Erreurs d'envoi ({len(errors)})</h3>
+        <ul>{"".join(f"<li>{e['participant']} : {e['error']}</li>" for e in errors)}</ul>
+        """
+    return f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto;">
+        <h2 style="color: #1F4E79;">Cycle de Règlement Clôturé</h2>
+        <p>Le cycle <strong>{settlement_id}</strong> est <strong style="color: green;">CLÔTURÉ</strong>.</p>
+        <table style="border-collapse: collapse; width: 100%;">
+            <tr style="background: #D6E4F0;">
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Settlement ID</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{settlement_id}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Participants notifies</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{len(participants)}</td>
+            </tr>
+            <tr style="background: #D6E4F0;">
+                <td style="padding: 8px; border: 1px solid #ccc;"><b>Date</b></td>
+                <td style="padding: 8px; border: 1px solid #ccc;">{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC</td>
+            </tr>
+        </table>
+        {error_section}
+        <p style="color: #595959; font-size: 12px; margin-top: 20px;">
+            Ce message est généré automatiquement par le Hub Mojaloop — BFT Projet.
+        </p>
+    </div>
+    """
 
 @app.get("/health")
 def health_check():

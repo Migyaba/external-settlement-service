@@ -1,83 +1,70 @@
 # Mojaloop External Settlement Notification Service
 
-Ce microservice FastAPI permet de gérer les **notifications de règlement externes** pour un Hub Mojaloop. Il assure la passerelle entre les règlements effectués hors-ligne (ex: virement bancaire RTGS) et le statut des transactions dans le Hub Mojaloop.
+Ce microservice est le module de **confirmation et de notification** pour les règlements externes hors Hub au sein de l'écosystème Mojaloop. Il permet aux participants de confirmer le transfert réel des fonds et automatise la clôture des cycles de règlement.
 
-## Fonctionnalités
+## Objectifs du Projet
+- **Quorum de Validation** : Attend que tous les participants d'un cycle (Payeurs et Payés) confirment le règlement pour finaliser le cycle.
+- **Synchronisation Hub** : Met à jour automatiquement les états des participants et du cycle sur le Hub Mojaloop.
+- **Alertes Automatisées** : Envoie des emails de confirmation aux participants (via SMTP Gmail) et des rapports de clôture à l'opérateur du Hub.
 
-- **Réception de notifications** : Endpoint pour que les participants (DFSPs) déclarent avoir effectué leur règlement.
-- **Vérification croisée** : Validation automatique auprès du Hub Mojaloop (API v2) pour vérifier l'existence du règlement et l'appartenance du participant.
-- **Gestion du Quorum** : Déclenche automatiquement la clôture du règlement (`SETTLED`) sur le Hub uniquement lorsque **tous** les participants concernés ont envoyé leur notification.
-- **Idempotence** : Gestion des doublons et des reprises sur erreur.
-- **Suivi en temps réel** : Endpoint de statut pour suivre l'avancement des notifications pour un `settlementId`.
-
-## Architecture & Tech Stack
-
+## Stack Technique
 - **Framework** : FastAPI (Python 3.12+)
-- **Base de données** : SQLite (via SQLAlchemy ORM) pour le stockage local des notifications.
-- **Communication** : Requests (intéraction avec Central Settlement Mojaloop).
-- **Conteneurisation** : Docker & Docker Compose prêts.
-
-## Pré-requis
-
-- Python 3.12+
-- Accès au Hub Mojaloop (Central Settlement Service)
-- Un tunnel `kubectl port-forward` ou une route directe vers le Hub.
+- **Base de données** : SQLite (via SQLAlchemy) pour l'idempotence des notifications.
+- **Emails** : SMTP Gmail avec sécurisation TLS (Port 587).
+- **Intégration** : Central Ledger et Central Settlement (Hub Mojaloop).
 
 ## Installation
 
-1. **Cloner le projet** :
+1. **Environnement Virtuel** :
    ```bash
-   git clone <url-du-repo>
-   cd external-settlement-service
-   ```
-
-2. **Configurer l'environnement** :
-   Créez un fichier `.env` à la racine :
-   ```env
-   HUB_BASE_URL=http://localhost:3000/v2
-   API_KEY=votre-cle-secrete-si-besoin
-   ```
-
-3. **Installer les dépendances** :
-   ```bash
-   python -m venv venv
+   python3 -m venv venv
    source venv/bin/activate
-   pip install -r requirements.txt
    ```
 
-4. **Lancer le service** :
+2. **Dépendances** :
    ```bash
-   uvicorn main:app --reload
+   pip install fastapi[standard] sqlalchemy requests python-dotenv
    ```
+
+3. **Lancement** :
+   ```bash
+   uvicorn main:app --reload --port 8001
+   ```
+
+## Configuration (.env)
+Pour activer les emails réels, créez un fichier `.env` :
+```env
+HUB_BASE_URL=http://localhost:3001/v2
+LEDGER_URL=http://localhost:4001
+OPERATOR_EMAIL=votre-email@gmail.com
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=votre-email@gmail.com
+SMTP_PASSWORD=votre-mot-de-passe-d-application
+```
 
 ## Utilisation de l'API
 
-### 1. Notifier un règlement
-**POST** `/external-settlement/{settlementId}`
-
-```bash
-curl -X POST http://localhost:8000/external-settlement/32 \
-     -H "Content-Type: application/json" \
-     -d '{
-       "participantId": "mtn-ci",
-       "amount": 50000,
-       "currency": "XOF",
-       "reference": "RTGS-2024-001"
-     }'
+### 1. Envoyer une Notification (POST)
+**Endpoint** : `/external-settlement/{settlement_id}`  
+**Description** : Utilisé par le participant pour confirmer son paiement.
+```json
+{
+  "participantId": "3",
+  "amount": 780.12,
+  "currency": "XXX",
+  "reference": "BANK-TRANSFER-998"
+}
 ```
 
-### 2. Vérifier l'avancement
-**GET** `/external-settlement/{settlement_id}/status`
+### 2. Consulter l'état des notifications (GET)
+**Endpoint** : `/settlement/{settlement_id}`  
+**Description** : Affiche le nombre de confirmations reçues sur le total attendu (Quorum).
 
-### 3. État de santé
-**GET** `/health`
+## Sécurité et Robustesse
+- **Validation Métier** : Le service vérifie que le montant et la devise correspondent exactement à ce qui est attendu par le Hub.
+- **Idempotence** : Un participant ne peut pas notifier deux fois le même règlement.
+- **Filtrage SMTP** : Le moteur d'email ignore automatiquement les adresses erronées ou les placeholders pour garantir la délivrabilité.
 
-## Docker (Optionnel)
-
-Pour lancer le service via Docker :
-```bash
-docker-compose up --build
-```
-
-## Sécurité
-En production, il est recommandé d'activer la dépendance `verify_api_key` dans `main.py` et de fournir un `X-API-Key` dans les headers des requêtes.
+---
+*Projet développé dans le cadre du module Settlement Matrix — BFT Projet.*

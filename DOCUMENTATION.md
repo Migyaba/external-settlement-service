@@ -141,18 +141,42 @@ sequenceDiagram
     participant S as Notification Service
     participant H as Hub (Central Settlement)
     participant L as Central Ledger
+    participant G as Gmail SMTP Server
     
     P->>S: POST /external-settlement/{id}
     S->>H: GET /settlements/{id} (Validation)
-    H-->>S: Détails du règlement & Participants
-    S->>S: Vérification ID & Quorum (SQLite)
-    S-->>P: 200 OK (Notification enregistrée)
+    H-->>S: 200 OK (Détails, Participants & Comptes)
     
-    Note over S: Si tout le monde a notifié
-    S->>H: PUT /settlements/{id} (State: SETTLED)
-    S->>L: GET /participants/{name}/endpoints
-    L-->>S: Emails de contact
-    S->>S: Envoi des Alertes aux Participants & Opérateur
+    S->>S: Validation Métier (Montant/Devise)
+    
+    Note over S: Mise à jour individuelle Hub
+    S->>H: PUT /id/part/{PID}/acc/{AID} (SETTLED)
+    H-->>S: 200 OK (Confirmation)
+    
+    S->>S: Persistence SQLite (idempotence)
+    
+    alt Si Quorum Atteint (Ex: 3/3)
+        Note over S: Finalisation Globale
+        S->>H: PUT /settlements/{id} (SETTLED)
+        H-->>S: 200 OK (Confirmation clôture)
+        
+        Note over S: Mapping Identités
+        S->>L: GET /participants
+        L-->>S: 200 OK (Liste complète participants)
+        
+        loop Pour chaque participant
+            S->>L: GET /participants/{name}/endpoints
+            L-->>S: 200 OK (Email de contact)
+            S->>G: SMTP SEND (Confirmation)
+            G-->>S: 250 OK (Message accepté)
+        end
+        S->>G: SMTP SEND (Rapport Opérateur)
+        G-->>S: 250 OK (Message accepté)
+        
+        S-->>P: 200 OK (Status: FINALIZED)
+    else Sinon (Quorum non atteint)
+        S-->>P: 200 OK (Status: PENDING_QUORUM)
+    end
 ```
 
 ---

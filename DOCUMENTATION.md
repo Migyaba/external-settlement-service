@@ -22,7 +22,7 @@ Le microservice n'intervient qu'à un moment très précis de la vie du Hub Moja
 
 1. **La Fermeture de la Fenêtre (Window)** : Les transactions s'accumulent pendant une période. Une fois finie, l'administrateur ferme la fenêtre. Plus aucun transfert ne peut y entrer.
 2. **Le Calcul du Règlement (Settlement)** : Le Hub calcule alors qui doit quoi à qui. Un objet *Settlement* est créé.
-3. **Le Moment de la Notification (L'activation)** : C'est ici que le service devient actif. Le participant peut envoyer de notification uniquement lorsque le règlement est dans l'un des trois états suivants :
+3. **Le Moment de la Notification (L'activation)** : C'est ici que le service devient actif. Le participant peut envoyer une notification lorsque le règlement est dans l'un des états suivants :
    - **PS_TRANSFERS_RECORDED** : Le Hub a fini ses calculs. Les montants sont figés et consultables. C'est le signal pour les banques d'initier leurs virements réels.
    - **PS_TRANSFERS_RESERVED** : Le Hub a "gelé" les fonds internes des participants. Il s'est assuré que chaque banque débitrice a la liquidité nécessaire.
    - **PS_TRANSFERS_COMMITTED** : Les écritures comptables internes sont faites dans les livres du Hub. C'est la dernière étape avant la clôture finale.
@@ -40,9 +40,9 @@ Notre service accepte ces trois états car, dans la réalité, une banque peut e
 ## 2. Aspects Techniques (Architecture et Stack)
 
 ### 2.1 Stack Technologique
-- **Back-end** : Python 3.12 avec FastAPI (Asynchrone et haute performance).
+- **Back-end** : Python 3.12+ avec FastAPI.
 - **Persistance** : SQLite via SQLAlchemy pour le suivi des notifications et l'idempotence.
-- **Communication** : REST API (JSON) avec gestion des timeouts réseau via `requests`.
+- **Communication** : REST API (JSON) et **SMTP Gmail** (via `smtplib`) pour les notifications sortantes.
 
 ### 2.2 Schéma d'Architecture de Données (Base SQLite)
 Table `notifications` :
@@ -52,7 +52,8 @@ Table `notifications` :
 - `amount` : Montant déclaré.
 - `currency` : Devise (ex: XOF, XTS).
 - `reference` : Preuve de virement (numéro RTGS/SWIFT).
-- `created_at` : Timestamp de réception pour audit.
+- `settled_at` : Date réelle du virement déclarée par le participant.
+- `created_at` : Timestamp de réception système (UTC).
 
 ### 2.3 Ports et Connectivité
 | Composant | Port | Type d'accès |
@@ -76,7 +77,8 @@ class SettlementNotificationRequest(BaseModel):
     participantId: str
     amount: float = Field(..., gt=0)
     currency: str = Field(..., min_length=3, max_length=3)
-    # ...
+    reference: str = Field(..., min_length=1)
+    settledAt: Optional[str] = None
 ```
 - **Ce que ça fait** : Le service utilise **Pydantic** pour valider automatiquement la complétude et le type des données envoyées par le participant.
 - **Pourquoi c'est important** : Cela garantit que le `participantId` est présent, que le `amount` est un nombre positif et que la `currency` respecte le format ISO. Si ces conditions ne sont pas remplies, l'API rejette la requête avec une erreur **422 Unprocessable Entity**.
@@ -91,15 +93,17 @@ hub_response = requests.get(f"{HUB_BASE_URL}/settlements/{settlement_id}", verif
 #### 3. Validation de l'état du règlement
 ```python
 state = settlement_data.get("state")
-allowed_states = ["PS_TRANSFERS_RECORDED","PS_TRANSFERS_RESERVED","PS_TRANSFERS_COMMITTED","SETTLED"]
+allowed_states = ["PS_TRANSFERS_RECORDED", "PS_TRANSFERS_RESERVED", "PS_TRANSFERS_COMMITTED", "SETTLED"]
 ```
 - **Ce que ça fait** : On vérifie que le règlement est dans un état où il est "prêt" à recevoir de l'argent (par exemple RECORDED ou COMMITTED).
 - **Pourquoi c'est important** : On ne veut pas accepter de notification si le règlement est déjà annulé (ABORTED).
 
 #### 4. Vérification d'appartenance et Conformité Métier
 ```python
-# Validation du montant et de la devise
-net_amount_obj = participant_accounts[0].get("netSettlementAmount", {})
+# Recherche du compte correspondant à la devise notifiée (Gestion Multi-devises)
+target_account = next((acc for acc in participant_accounts if acc.get("netSettlementAmount", {}).get("currency") == currency), None)
+hub_amount = target_account.get("netSettlementAmount", {}).get("amount")
+
 if abs(float(amount) - abs(float(hub_amount))) > 0.01:
     raise HTTPException(...)
 ```
@@ -122,15 +126,11 @@ db.commit()
 - **Ce que ça fait** : Une fois que toutes les vérifications sont OK, on sauvegarde la preuve du règlement dans la base de données locale.
 - **Pourquoi c'est important** : C'est ce qui permet de garder une trace (audit) et de compter combien de personnes ont déjà payé.
 
-#### 7. Le Quorum et la Clôture automatique (Étape Finale)
-```python
-if notified_count >= total_needed:
-   requests.put(..., json={"state": "SETTLED"})
-```
-- **Ce que ça fait** : Le code compte combien de notifications ont été reçues pour ce settlement. Si ce compte est égal au nombre total de participants prévus, le service se dit : "C'est bon, tout le monde a payé !" et il envoie l'ordre au Hub de clôturer définitivement le règlement.
-
-#### Bonus : Diffusion des Alertes
-Une fois la clôture effectuée, le service déclenche automatiquement l'envoi des notifications aux parties prenantes (Participants et Opérateur) en utilisant les emails récupérés dynamiquement dans le Central Ledger.
+#### 7. Mise à jour granulaire et Quorum (Étape Finale)
+- **Mise à jour Participant** : Dès réception d'une notification valide, le service envoie un `PUT` au Hub pour passer le compte spécifique de ce participant à l'état **SETTLED**.
+- **Quorum** : Le code compte les notifications reçues. Si le quota est atteint, il ordonne au Hub de clôturer définitivement le règlement global.
+- **Remplacement** : Les alertes sont désormais envoyées via le serveur **SMTP Gmail** 
+- **Filtrage Intelligent** : Le service détecte et ignore les emails malformés ou les "placeholders" (ex: `{$inputs.email}`) souvent présents dans les environnements de test du Ledger.
 
 ---
 
